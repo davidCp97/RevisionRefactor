@@ -1,0 +1,179 @@
+// app.ts
+
+// 1.PROBLEMA (Arquitectura/Clean Architecture):
+// - Todo vive en un único archivo y sin capas claras (domain, application, infrastructure, interfaces).
+// RIESGO: baja mantenibilidad, difícil testear y escalar.
+// SUGERENCIA: separar (aunque sea lógicamente) en capas; definir puertos (interfaces) e inyectar dependencias.
+
+import Fastify from "fastify";
+
+class CheckpointManager {
+  // 2.PROBLEMA (Type Safety / Clean Code):
+  // - Uso de any[] impide detección temprana de errores.
+  // SUGERENCIA: definir interfaces/ tipos (por ejemplo `interface Checkpoint { id: string; unitId: string; status: Status; eventTime: Date; ... }`)
+  checkpoints: any[] = [];
+
+  createCheckpoint(unitId: string, status: string, timestamp: Date) {
+    // 3.PROBLEMA (Modelado de dominio):
+    // - `status: string` debiera ser un `enum Status` para evitar typos y restringir valores.
+    // 4.PROBLEMA (IDs):
+    // - `Math.random().toString()` no garantiza unicidad ni formato.
+    // SUGERENCIA: usar `crypto.randomUUID()` o DB autoincremental.
+    // 5.PROBLEMA (Semántica / YAGNI):
+    // - `history: []` dentro del mismo checkpoint no se usa y genera ruido.
+    // SUGERENCIA: removerlo si no aporta.
+    // 6.PROBLEMA (Correctitud / Diseño de API):
+    // - `timestamp` se convierte a string aquí; mejor mantener `Date` en dominio y serializar en la interfaz.
+    this.checkpoints.push({
+      id: Math.random().toString(),
+      unitId,
+      status,
+      timestamp: timestamp.toISOString(),
+      history: []
+    });
+
+    // 7.PROBLEMA (Diseño de API):
+    // - Retorna TODO el arreglo en vez del checkpoint creado.
+    // RIESGO: mayor payload y semántica confusa.
+    // SUGERENCIA: devolver solo el recurso creado o un DTO `{status:'created', id:...}`.
+    return this.checkpoints;
+  }
+
+  getHistory(unitId: string) {
+    // 8.PROBLEMA (Clean Code):
+    // - Uso de `==` en vez de `===` puede causar comparaciones inesperadas.
+    // SUGERENCIA: usar `===`.
+    // 9.PROBLEMA (Escalabilidad/Correctitud):
+    // - Sin orden garantizado por tiempo, sin paginación y sin copia defensiva (expone referencias internas).
+    // SUGERENCIA: ordenar por fecha ascendente, paginar (`offset/limit`), y retornar copias/DTOs.
+    return this.checkpoints.filter(c => c.unitId == unitId);
+  }
+}
+
+// 9.PROBLEMA (Consistencia de dominio):
+// - Se introduce un segundo "modelo" de estado de unidad distinto al basado en checkpoints.
+// RIESGO: doble fuente de verdad (divergencias entre `units` y los checkpoints reales).
+// SUGERENCIA: derivar el `lastStatus` del último checkpoint no-EXCEPTION; evitar mantener otro store paralelo.
+class UnitStatusService {
+  // 10. PROBLEMA (Type Safety):
+  // - `any[]` otra vez; definir `Unit` con tipos.
+  units: any[] = [];
+
+  updateUnitStatus(unitId: string, newStatus: string) {
+    // 11.PROBLEMA (Clean Code):
+    // - `==` en vez de `===`.
+    // PROBLEMA (Modelado):
+    // - `newStatus` debería ser `Status` (enum).
+    let unit = this.units.find(u => u.id == unitId);
+    if (!unit) {
+      unit = { id: unitId, status: newStatus, checkpoints: [] };
+      this.units.push(unit);
+    }
+    unit.status = newStatus;
+
+    // 12. PROBLEMA (Sintaxis/Correctitud):
+    // - Salto de línea después de `new` rompe la compilación.
+    // - Formato de fecha `toString()` no es ISO; complica orden/parsing.
+    // SUGERENCIA: `new Date().toISOString()` en una sola línea.
+    unit.checkpoints.push({ status: newStatus, date: new
+    Date().toString() });
+
+    // 13.PROBLEMA (Dominio):
+    // - No hay validación de transiciones (no repetir, no retroceder, CREATED único, tiempo no decreciente).
+    // SUGERENCIA: mover reglas a una Policy de dominio que evalúe la historia de checkpoints antes de cambiar estado.
+    return unit;
+  }
+
+  getUnitsByStatus(status: string) {
+    // 14.PROBLEMA (Modelado):
+    // - `status` debería ser `Status` (enum) y validado.
+    // 15. PROBLEMA (Consistencia):
+    // - Filtra por el estado almacenado aquí, que puede no coincidir con el derivado de checkpoints.
+    return this.units.filter(u => u.status == status);
+  }
+}
+
+class TrackingAPI {
+  // 16.PROBLEMA (DIP / SOLID):
+  // - Instancias creadas adentro acoplan la API a implementaciones concretas, dificultando test/ reemplazo.
+  // SUGERENCIA: Inyección de dependencias (pasar repos/servicios por constructor).
+  checkpointManager = new CheckpointManager();
+  unitService = new UnitStatusService();
+
+  registerRoutes(app: any) {
+    // 17. PROBLEMA (Type Safety):
+    // - `app: any`, `req: any`, `reply: any` pierden tipado de Fastify.
+    // SUGERENCIA: usar tipos de Fastify o DTOs.
+
+    app.post("/checkpoint", async (req: any, reply: any) => {
+      // 18. PROBLEMA (Validación):
+      // - No se valida `unitId` ni `status` ni formato de fecha.
+      // - `status` debería ser `enum Status`.
+      // 19. PROBLEMA (Idempotencia):
+      // - No hay soporte para `Idempotency-Key`. Reintentos pueden duplicar checkpoints.
+      const { unitId, status } = req.body;
+
+      // 20. PROBLEMA (Dominio):
+      // - Se fuerza `new Date()` en el controlador; debería venir del cliente (o definirse regla) y validarse.
+      // - No hay política de transiciones.
+      const cp = this.checkpointManager.createCheckpoint(unitId,
+      status, new Date());
+
+      // 21. PROBLEMA (Consistencia):
+      // - Se actualiza un store paralelo (`UnitStatusService`) separado de los checkpoints.
+      // SUGERENCIA: derivar el último estado del historial de checkpoints, no duplicar estado.
+      this.unitService.updateUnitStatus(unitId, status);
+
+      // 22. PROBLEMA (Diseño de API):
+      // - Se devuelve `cp` (toda la lista) en lugar del elemento creado o un DTO.
+      // SUGERENCIA: devolver `{status:'created', id: <id>}` o el checkpoint creado.
+      reply.send(cp);
+    });
+
+    app.get("/history", async (req: any, reply: any) => {
+      // 23. PROBLEMA (REST):
+      // - Recurso por query `?unitId=` en vez de `GET /history/:unitId`.
+      // SUGERENCIA: soportar path param y opcionalmente dejar query por compatibilidad.
+      // 24. PROBLEMA (Validación/Paginación/Orden):
+      // - Sin validar `unitId`, sin `page/pageSize`, sin orden explícito.
+      const { unitId } = req.query as any;
+      reply.send(this.checkpointManager.getHistory(unitId));
+    });
+
+    app.get("/unitsByStatus", async (req: any, reply: any) => {
+      // 25. PROBLEMA (Validación):
+      // - `status` viene sin validar; debería restringirse a un enum.
+      // 26. PROBLEMA (Consistencia):
+      // - La fuente de verdad debería ser el último checkpoint no-EXCEPTION, no un store aparte.
+      const { status } = req.query as any;
+      reply.send(this.unitService.getUnitsByStatus(status));
+    });
+  }
+}
+
+const app = Fastify();
+
+const api = new TrackingAPI();
+api.registerRoutes(app);
+
+app.listen({ port: 3000 }, (err: any, address: string) => {
+  if (err) {
+    // 27. PROBLEMA (Observabilidad):
+    // - No se loguea el error; solo se sale del proceso.
+    // SUGERENCIA: `console.error(err)` o `app.log.error(err)` antes de salir.
+    process.exit(1);
+  }
+  console.log(`Server running at ${address}`);
+});
+
+// PROBLEMAS GENERALES (Seguridad/Operabilidad):
+// - No hay autenticación/autorización (JWT/API key) ni scopes → riesgo de acceso no autorizado.
+// - Sin rate limiting / helmet / CORS configurados → riesgo de abuso/DoS y cabeceras débiles.
+// - Sin manejador global de errores consistente → respuestas heterogéneas/500 genéricos.
+// - Sin métricas o trazas → difícil diagnóstico en prod.
+// SUGERENCIAS:
+// - Añadir middleware de validación, handler de errores (400/409/500), rate limit, helmet.
+// - Diseñar contrato de API (OpenAPI) y tests.
+// - Implementar idempotencia con `Idempotency-Key` y store de hash del payload.
+// - Incorporar Policy de transición: no retroceso, no repetición, CREATED único, tiempo no decreciente.
+// - Derivar `lastStatus` desde historial de checkpoints (no mantener dos fuentes de verdad).
